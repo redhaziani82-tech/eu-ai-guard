@@ -3,18 +3,19 @@ import time
 import uuid
 from datetime import datetime, timezone
 from typing import List, Optional
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends
 from pydantic import BaseModel
 from google import genai
 from google.genai import types
 from app.config import settings
 from app.redactor import PIIRedactor
 from app.classifier import EUAIActClassifier
+from app.auth import verify_customer_api_key, get_supabase
 
 app = FastAPI(
     title="EU AI Guard",
-    description="Open-Source EU AI Act Compliance & Guardrail Proxy for LLMs",
-    version="1.0.0",
+    description="EU AI Act Compliance & GDPR Guardrail Proxy for LLMs",
+    version="1.1.0",
 )
 
 redactor = PIIRedactor()
@@ -38,18 +39,38 @@ class ChatCompletionRequest(BaseModel):
     restore_pii_in_response: Optional[bool] = True
 
 
-def log_audit_event(payload: dict):
+def record_audit_and_usage(customer: dict, payload: dict):
     with open(settings.audit_log_path, "a", encoding="utf-8") as f:
         f.write(json.dumps(payload) + "\n")
+
+    sb = get_supabase()
+    customer_id = customer.get("id")
+    if sb and customer_id:
+        sb.table("audit_logs").insert({
+            "customer_id": customer_id,
+            "request_id": payload["request_id"],
+            "action": payload["action"],
+            "model": payload.get("model", settings.default_model),
+            "pii_detected": payload.get("pii_detected", []),
+            "risk_level": payload["compliance"].get("risk_level", "MINIMAL_RISK"),
+            "article_reference": payload["compliance"].get("article_reference", "N/A"),
+            "latency_ms": payload.get("latency_ms", 0),
+        }).execute()
+
+        new_count = customer.get("requests_used", 0) + 1
+        sb.table("customers").update({"requests_used": new_count}).eq("id", customer_id).execute()
 
 
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy", "version": "1.0.0", "eu_ai_act_engine": "active"}
+    return {"status": "healthy", "version": "1.1.0", "eu_ai_act_engine": "active"}
 
 
 @app.post("/v1/chat/completions")
-async def create_chat_completion(request: ChatCompletionRequest):
+async def create_chat_completion(
+    request: ChatCompletionRequest,
+    customer: dict = Depends(verify_customer_api_key),
+):
     request_id = f"eu-guard-{uuid.uuid4().hex[:12]}"
     start_time = time.perf_counter()
 
@@ -64,12 +85,14 @@ async def create_chat_completion(request: ChatCompletionRequest):
     risk_level = compliance_result.get("risk_level", "MINIMAL_RISK")
 
     if settings.enable_strict_blocking and risk_level == "PROHIBITED":
-        log_audit_event({
+        record_audit_and_usage(customer, {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "request_id": request_id,
             "action": "BLOCKED",
+            "model": request.model,
             "pii_detected": pii_types,
             "compliance": compliance_result,
+            "latency_ms": 0,
         })
         raise HTTPException(
             status_code=403,
@@ -96,7 +119,7 @@ async def create_chat_completion(request: ChatCompletionRequest):
 
     latency_ms = round((time.perf_counter() - start_time) * 1000, 2)
 
-    log_audit_event({
+    record_audit_and_usage(customer, {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "request_id": request_id,
         "action": "ALLOWED",
