@@ -1,0 +1,10 @@
+services:
+  eu-ai-guard:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    volumes:
+      - ./audit_logs.jsonl:/app/audit_logs.jsonl
+    restart: unless-stopped
