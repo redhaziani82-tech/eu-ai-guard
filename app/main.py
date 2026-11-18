@@ -148,3 +148,6 @@ async def create_chat_completion(
             "latency_ms": latency_ms,
         },
     }
+
+from app.dashboard import router as dashboard_router
+app.include_router(dashboard_router)
